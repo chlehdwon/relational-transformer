@@ -94,6 +94,11 @@ def main(
     d_model,
     num_heads,
     d_ff,
+    # contrastive learning
+    use_fk_contrastive=False,
+    use_row_contrastive=False,
+    contrastive_weight=0.1,
+    contrastive_temperature=0.07,
 ):
     seed_everything(seed)
 
@@ -162,7 +167,7 @@ def main(
                 eval_dataset,
                 batch_size=None,
                 num_workers=num_workers,
-                persistent_workers=True,
+                persistent_workers=num_workers > 0,  # Only enable if num_workers > 0
                 pin_memory=True,
                 in_order=True,
             )
@@ -173,6 +178,10 @@ def main(
         d_text=d_text,
         num_heads=num_heads,
         d_ff=d_ff,
+        use_fk_contrastive=use_fk_contrastive,
+        use_row_contrastive=use_row_contrastive,
+        contrastive_weight=contrastive_weight,
+        contrastive_temperature=contrastive_temperature,
     )
     if load_ckpt_path is not None:
         load_ckpt_path = Path(load_ckpt_path).expanduser()

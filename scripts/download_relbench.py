@@ -8,4 +8,9 @@ if __name__ == "__main__":
 
         for task_name in get_task_names(dataset_name):
             print(f"Downloading task: {task_name} from dataset: {dataset_name}")
-            get_task(dataset_name, task_name, download=True)
+            try:
+                get_task(dataset_name, task_name, download=True)
+            except Exception as e:
+                print(f"Error downloading task: {task_name} from dataset: {dataset_name}")
+                print(e)
+                continue

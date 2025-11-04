@@ -2,6 +2,7 @@ import json
 import os
 from functools import partial
 from pathlib import Path
+from torch.nn.attention.flex_attention import BlockMask
 
 import numpy as np
 import torch
@@ -109,6 +110,10 @@ class RelationalTransformer(nn.Module):
         d_text,
         num_heads,
         d_ff,
+        use_fk_contrastive=False,
+        use_row_contrastive=False,
+        contrastive_weight=0.1,
+        contrastive_temperature=0.07,
     ):
         super().__init__()
 
@@ -149,6 +154,224 @@ class RelationalTransformer(nn.Module):
         )
         self.norm_out = nn.RMSNorm(d_model)
         self.d_model = d_model
+        
+        # Contrastive learning parameters (shared weight and temperature)
+        self.use_fk_contrastive = use_fk_contrastive
+        self.use_row_contrastive = use_row_contrastive
+        self.contrastive_weight = contrastive_weight
+        self.contrastive_temperature = contrastive_temperature
+    
+    def fk_contrastive_loss(self, batch, x):
+        """
+        FK relationship based contrastive loss (optimized version).
+        
+        Positive pairs: Nodes connected by FK
+        Negative pairs: Unconnected nodes
+        
+        Args:
+            batch: Input batch dict
+            x: Transformer output (B, S, d_model)
+        
+        Returns:
+            contrast_loss: Scalar loss
+        """
+        node_idxs = batch["node_idxs"]  # (B, S)
+        f2p_nbr_idxs = batch["f2p_nbr_idxs"]  # (B, S, 5)
+        is_padding = batch["is_padding"]  # (B, S)
+        masks = batch["masks"]  # (B, S) - masked cells to predict
+        
+        B, S, D = x.shape
+        device = x.device
+        
+        # Create valid mask: exclude padding AND masked cells
+        valid_mask = ~is_padding & ~masks  # (B, S)
+        
+        # Flatten batch and sequence dimensions
+        x_flat = x.view(B * S, D)  # (B*S, d_model)
+        node_idxs_flat = node_idxs.view(-1)  # (B*S,)
+        valid_mask_flat = valid_mask.view(-1)  # (B*S,)
+        
+        # Filter out padding
+        valid_x = x_flat[valid_mask_flat]  # (V, d_model)
+        valid_node_idxs = node_idxs_flat[valid_mask_flat]  # (V,)
+        
+        # Get unique node IDs and filter out padding (-1)
+        unique_nodes, inverse_indices = torch.unique(valid_node_idxs, return_inverse=True)
+        valid_node_mask = unique_nodes != -1
+        unique_nodes = unique_nodes[valid_node_mask]
+        
+        num_nodes = unique_nodes.shape[0]
+        if num_nodes < 2:
+            return x.new_zeros(())
+        
+        # Map node IDs to indices using searchsorted (fully vectorized)
+        # Sort unique_nodes for searchsorted
+        sorted_nodes, sort_idx = torch.sort(unique_nodes)
+        
+        # Map each valid cell to its node index (in sorted order)
+        node_mapping = torch.searchsorted(sorted_nodes, valid_node_idxs)
+        
+        # Handle out of bounds (nodes not in unique_nodes, though shouldn't happen)
+        valid_cells_mask = (node_mapping < num_nodes) & (sorted_nodes[node_mapping] == valid_node_idxs)
+        valid_x = valid_x[valid_cells_mask]
+        node_mapping = sort_idx[node_mapping[valid_cells_mask]]  # Map back to original order
+        
+        # Compute node representations using scatter_add
+        node_reprs = torch.zeros(num_nodes, D, device=device, dtype=x.dtype)
+        node_counts = torch.zeros(num_nodes, device=device, dtype=x.dtype)
+        
+        node_reprs.scatter_add_(0, node_mapping.unsqueeze(1).expand(-1, D), valid_x)
+        node_counts.scatter_add_(0, node_mapping, torch.ones_like(node_mapping, dtype=x.dtype))
+        
+        # Average pooling
+        node_reprs = node_reprs / node_counts.unsqueeze(1).clamp(min=1)
+        
+        # Build neighbor adjacency matrix efficiently
+        # Collect all neighbor relationships at once
+        f2p_nbr_idxs_flat = f2p_nbr_idxs.view(B * S, -1)  # (B*S, 5)
+        valid_nbr_idxs = f2p_nbr_idxs_flat[valid_mask_flat]  # (V, 5)
+        valid_nbr_idxs = valid_nbr_idxs[valid_cells_mask]  # (V', 5)
+        
+        # Build positive mask - fully vectorized approach
+        pos_mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool, device=device)
+        
+        # Get first cell index for each node using scatter
+        # Create inverse mapping: for each cell, mark if it's the first cell of its node
+        sorted_mapping, sort_indices = torch.sort(node_mapping)
+        
+        # Find first occurrence of each node_id
+        unique_mapping = torch.unique_consecutive(sorted_mapping, return_inverse=False)
+        first_cell_mask = torch.cat([
+            torch.tensor([True], device=device),
+            sorted_mapping[1:] != sorted_mapping[:-1]
+        ])
+        first_cell_per_node_unsorted = sort_indices[first_cell_mask]
+        
+        # Map back to node indices (first_cell_per_node_unsorted is in sorted order of node_mapping)
+        # We need to create a mapping from node_idx to first_cell
+        first_cell_per_node = torch.zeros(num_nodes, dtype=torch.long, device=device)
+        node_ids_with_cells = sorted_mapping[first_cell_mask]
+        first_cell_per_node[node_ids_with_cells] = first_cell_per_node_unsorted
+        
+        # Get neighbors for all nodes at once (N, 5)
+        all_nbrs = valid_nbr_idxs[first_cell_per_node]  # (N, 5)
+        
+        # Vectorized neighbor matching using broadcasting
+        # all_nbrs: (N, 5), unique_nodes: (N,)
+        # Create comparison: (N, 5, N) where [i, j, k] = (all_nbrs[i, j] == unique_nodes[k])
+        all_nbrs_expanded = all_nbrs.unsqueeze(2)  # (N, 5, 1)
+        unique_nodes_expanded = unique_nodes.unsqueeze(0).unsqueeze(0)  # (1, 1, N)
+        
+        # matches[i, j, k] = True if node i's j-th neighbor equals unique_nodes[k]
+        matches = (all_nbrs_expanded == unique_nodes_expanded)  # (N, 5, N)
+        
+        # Filter out -1 (padding) neighbors
+        valid_nbr_mask = (all_nbrs != -1).unsqueeze(2)  # (N, 5, 1)
+        matches = matches & valid_nbr_mask  # (N, 5, N)
+        
+        # Aggregate over neighbor dimension: pos_mask[i, k] = True if any neighbor of i equals unique_nodes[k]
+        pos_mask = matches.any(dim=1)  # (N, N)
+        
+        # Make bidirectional
+        pos_mask = pos_mask | pos_mask.t()
+        
+        # Remove self-connections
+        pos_mask.fill_diagonal_(False)
+        
+        if not pos_mask.any():
+            return x.new_zeros(())
+        
+        # Normalize representations
+        node_reprs_norm = F.normalize(node_reprs, dim=-1)  # (N, d_model)
+        
+        # Compute similarity matrix
+        sim_matrix = torch.matmul(node_reprs_norm, node_reprs_norm.t())  # (N, N)
+        sim_matrix = sim_matrix / self.contrastive_temperature
+        
+        # Fully vectorized InfoNCE loss computation
+        has_positive = pos_mask.any(dim=1)  # (N,)
+        if not has_positive.any():
+            return x.new_zeros(())
+        
+        # Create mask for all samples except self
+        eye_mask = torch.eye(num_nodes, dtype=torch.bool, device=device)  # (N, N)
+        
+        # For numerical stability, subtract max before exp
+        sim_matrix_stable = sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0]
+        
+        # Mask out self-similarities for denominator
+        exp_sim = torch.exp(sim_matrix_stable)
+        exp_sim_masked = exp_sim.masked_fill(eye_mask, 0.0)  # (N, N)
+        
+        # Denominator: sum over all non-self samples
+        denominator = exp_sim_masked.sum(dim=1)  # (N,)
+        
+        # Numerator: sum over positive samples only
+        exp_pos = exp_sim.masked_fill(~pos_mask, 0.0)  # (N, N)
+        numerator = exp_pos.sum(dim=1)  # (N,)
+        
+        # InfoNCE loss: -log(numerator / denominator)
+        # Only compute for nodes with positive pairs
+        loss_per_node = -torch.log(numerator[has_positive] / denominator[has_positive] + 1e-8)
+        
+        return loss_per_node.mean()
+
+    def row_contrastive_loss(self, batch, x):
+        """
+        Intra-Node Consistency Contrastive Loss (Row-level)
+        
+        Positive pairs: Cell token -> its node pooled embedding
+        Negative pairs: Cell token -> other nodes' pooled embeddings
+        
+        Args:
+            batch: Input batch dict
+            x: Transformer output (B, S, d_model)
+        
+        Returns:
+            contrast_loss: Scalar loss
+        """
+        node_idxs = batch["node_idxs"]        # (B, S)
+        is_padding = batch["is_padding"]      # (B, S)
+        masks = batch["masks"]                # (B, S) - masked cells to predict
+        B, S, D = x.shape
+        device = x.device
+
+        # Extract valid tokens only: exclude padding AND masked cells
+        valid = (~is_padding & ~masks).view(-1)        # (B*S,)
+        h = x.view(B*S, D)[valid]                      # (V, D)
+        nids = node_idxs.view(-1)[valid].long()        # (V,)
+
+        # Remove padding nodes (-1)
+        keep = nids != -1
+        h, nids = h[keep], nids[keep]
+        if h.numel() == 0:
+            return x.new_zeros(())
+
+        # Get unique nodes and node pooling (average)
+        uniq, inv = torch.unique(nids, return_inverse=True)   # inv: (V,) in [0..N-1]
+        N = uniq.size(0)
+        if N < 2:
+            return x.new_zeros(())
+
+        # Average pooling for node representations
+        node_sum = torch.zeros(N, D, device=device, dtype=h.dtype)
+        node_cnt = torch.zeros(N, device=device, dtype=h.dtype)
+        node_sum.scatter_add_(0, inv.unsqueeze(1).expand(-1, D), h)
+        node_cnt.scatter_add_(0, inv, torch.ones_like(inv, dtype=h.dtype))
+        z = node_sum / node_cnt.clamp(min=1).unsqueeze(1)     # (N, D)
+
+        # Normalize cell and node representations
+        q = F.normalize(h, dim=-1)           # (V, D) - cell representations
+        k = F.normalize(z, dim=-1)           # (N, D) - node representations
+
+        # Similarity matrix: each cell vs all nodes
+        # sim[i, m] = q_i · k_m / tau
+        sim = (q @ k.t()) / self.contrastive_temperature      # (V, N)
+
+        # Labels: each cell's ground truth node index is inv
+        # InfoNCE loss (cell-to-node classification)
+        loss = F.cross_entropy(sim, inv, reduction='mean')
+        return loss
 
     def forward(self, batch):
         node_idxs = batch["node_idxs"]
@@ -227,6 +450,14 @@ class RelationalTransformer(nn.Module):
             x = block(x, block_masks)
 
         x = self.norm_out(x)
+        
+        # Contrastive losses (can be used independently or together)
+        contrast_loss = x.new_zeros(())
+        if self.training:
+            if self.use_fk_contrastive:
+                contrast_loss = contrast_loss + self.fk_contrastive_loss(batch, x)
+            if self.use_row_contrastive:
+                contrast_loss = contrast_loss + self.row_contrastive_loss(batch, x)
 
         loss_out = x.new_zeros(())
         yhat_out = {"number": None, "text": None, "datetime": None, "boolean": None}
@@ -263,5 +494,8 @@ class RelationalTransformer(nn.Module):
                 yhat_out[t] = yhat
 
         loss_out = loss_out / masks.sum()
+        
+        # Add contrastive loss with weight
+        total_loss = loss_out + self.contrastive_weight * contrast_loss
 
-        return loss_out, yhat_out
+        return total_loss, yhat_out
