@@ -183,4 +183,11 @@ item = dataset[40]
 fig, ax = plt.subplots(figsize=(12, 8), layout="constrained")
 ax.set_axis_off()
 result = viz(item, ax, dataset_name)
+
+# Save the figure
+output_dir = Path("outputs")
+output_dir.mkdir(exist_ok=True)
+output_path = output_dir / f"{dataset_name}_{table_name}_graph.png"
+fig.savefig(output_path, dpi=300, bbox_inches='tight')
+print(f"Graph saved to: {output_path.absolute()}")
 fig.show()

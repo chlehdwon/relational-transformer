@@ -2,6 +2,7 @@ import os
 import random
 import time
 from pathlib import Path
+from collections import Counter, defaultdict
 
 import numpy as np
 import torch
@@ -63,7 +64,7 @@ def all_gather_nd(tensor: torch.Tensor) -> list[torch.Tensor]:
     return all_tensors
 
 
-def main(
+def main_analysis(
     # misc
     project,
     eval_splits,
@@ -121,7 +122,7 @@ def main(
         print(run.name)
 
     torch.multiprocessing.set_sharing_strategy("file_system")
-    torch._dynamo.config.cache_size_limit = 16
+    torch._dynamo.config.cache_size_limit = 64  # Increased from 16 to handle dynamic shapes better
     torch._dynamo.config.compiled_autograd = compile_ if ddp else False
     torch._dynamo.config.optimize_ddp = True
     torch.set_num_threads(1)
@@ -216,7 +217,7 @@ def main(
     if ddp:
         net = DDP(net)
 
-    net = torch.compile(net, dynamic=False, disable=not compile_)
+    net = torch.compile(net, dynamic=True, disable=not compile_)
 
     steps = 0
     if rank == 0:
@@ -254,6 +255,10 @@ def main(
                 labels = []
                 losses = []
                 eval_load_times = []
+                
+                # Analysis: track predictions per entity with their sampled label counts
+                entity_analysis = defaultdict(list)  # node_idx -> list of (num_sampled_labels, prediction, ground_truth)
+                
                 eval_loader = eval_loaders[(db_name, table_name, split)]
                 pbar = tqdm(
                     total=(
@@ -305,6 +310,50 @@ def main(
                     losses.append(loss.item())
                     preds.append(pred)
                     labels.append(y)
+                    
+                    # Analysis: Count how many previous labels of the SAME entity are in the sequence
+                    if rank == 0:
+                        is_targets_batch = batch["is_targets"][:true_batch_size]
+                        node_idxs_batch = batch["node_idxs"][:true_batch_size]
+                        is_task_nodes_batch = batch["is_task_nodes"][:true_batch_size]
+                        
+                        # Each sample in the batch has one target that we're predicting
+                        for b in range(true_batch_size):
+                            target_mask = is_targets_batch[b]
+                            task_node_mask = is_task_nodes_batch[b]
+                            
+                            # Get all node_idxs that are targets (labels) in this sequence
+                            target_node_idxs = node_idxs_batch[b][target_mask].cpu().numpy()
+                            
+                            if len(target_node_idxs) == 0:
+                                continue
+                            
+                            # Each sample has one prediction and one label
+                            target_pred = pred[b].cpu().item()
+                            target_label = y[b].cpu().item()
+                            
+                            # Get the entity (node_idx) we're predicting for
+                            # This is the entity ID whose future label we want to predict
+                            entity_id = int(target_node_idxs[0])
+                            
+                            # Count how many times THIS SAME entity appears in task nodes
+                            # Note: Each row appears as 2 nodes in the graph (row node + paired node)
+                            # The target entity itself is also in task nodes, so we need to subtract it
+                            
+                            all_task_node_idxs = node_idxs_batch[b][task_node_mask].cpu().numpy()
+                            num_in_task_nodes = np.sum(all_task_node_idxs == entity_id)
+                            
+                            # Convert nodes to records (divide by 2)
+                            total_records = num_in_task_nodes // 2
+                            
+                            # Subtract 1 for the target itself (the current record we're predicting)
+                            # This gives us the number of HISTORICAL records (past data)
+                            num_historical_records = total_records - 1
+                            
+                            # Make sure it's not negative (in case target is not in task nodes somehow)
+                            num_historical_records = max(0, num_historical_records)
+                            
+                            entity_analysis[entity_id].append((num_historical_records, target_pred, target_label))
 
                     if max_eval_steps is not None and max_eval_steps > -1 and batch_idx >= max_eval_steps:
                         break
@@ -350,6 +399,76 @@ def main(
                     wandb.log({k: metric}, step=steps)
                     print(f"\nstep={steps}, \t{k}: {metric}")
                     metrics[split][(db_name, table_name)] = metric
+                    
+                    # Analysis: Distribution of sampled label counts and accuracy
+                    print(f"\n{'='*80}")
+                    print(f"Label Count Distribution Analysis for {db_name}/{table_name}/{split}")
+                    print(f"{'='*80}")
+                    
+                    # Count distribution and accuracy by number of sampled entities
+                    label_count_stats = defaultdict(lambda: {"total": 0, "correct": 0})
+                    
+                    # Debug: check prediction value range
+                    all_pred_vals = []
+                    all_true_vals = []
+                    
+                    for node_idx, records in entity_analysis.items():
+                        for num_labels, pred_val, true_val in records:
+                            label_count_stats[num_labels]["total"] += 1
+                            all_pred_vals.append(pred_val)
+                            all_true_vals.append(true_val)
+                            
+                            # Check if prediction is correct
+                            if task_type == "clf":
+                                # Use 0.0 as threshold for logits (before sigmoid)
+                                # If values are already sigmoids (0-1), this still works reasonably
+                                pred_class = 1 if pred_val > 0.0 else 0
+                                true_class = 1 if true_val > 0 else 0
+                                if pred_class == true_class:
+                                    label_count_stats[num_labels]["correct"] += 1
+                            elif task_type == "reg":
+                                # For regression, we'll compute this differently later
+                                # For now, just count total
+                                pass
+                    
+                    # Debug: print prediction statistics
+                    if task_type == "clf" and len(all_pred_vals) > 0:
+                        print(f"\nPrediction value stats:")
+                        print(f"  Min: {min(all_pred_vals):.4f}, Max: {max(all_pred_vals):.4f}")
+                        print(f"  Mean: {np.mean(all_pred_vals):.4f}, Std: {np.std(all_pred_vals):.4f}")
+                        print(f"Label distribution: {Counter(all_true_vals)}")
+                    
+                    # Print results sorted by number of sampled labels
+                    if task_type == "clf":
+                        print(f"\n{'Same Entity':<15} {'Count':<10} {'Percentage':<12} {'Accuracy':<12}")
+                        print(f"{'-'*80}")
+                    else:
+                        print(f"\n{'Same Entity':<15} {'Count':<10} {'Percentage':<12}")
+                        print(f"{'-'*80}")
+                    
+                    total_predictions = sum(stats["total"] for stats in label_count_stats.values())
+                    for num_labels in sorted(label_count_stats.keys()):
+                        stats = label_count_stats[num_labels]
+                        count = stats["total"]
+                        percentage = (count / total_predictions * 100) if total_predictions > 0 else 0
+                        
+                        if task_type == "clf":
+                            accuracy = (stats["correct"] / count * 100) if count > 0 else 0
+                            print(f"{num_labels:<15} {count:<10} {percentage:>10.2f}% {accuracy:>10.2f}%")
+                        else:
+                            print(f"{num_labels:<15} {count:<10} {percentage:>10.2f}%")
+                    
+                    print(f"\n{'='*80}")
+                    print(f"Total predictions: {total_predictions}")
+                    print(f"Total unique entities: {len(entity_analysis)}")
+                    print(f"Average samples per entity: {total_predictions / len(entity_analysis):.2f}" if len(entity_analysis) > 0 else "N/A")
+                    
+                    if task_type == "clf":
+                        total_correct = sum(stats["correct"] for stats in label_count_stats.values())
+                        overall_accuracy = (total_correct / total_predictions * 100) if total_predictions > 0 else 0
+                        print(f"Overall accuracy: {overall_accuracy:.2f}%")
+                    
+                    print(f"{'='*80}\n")
 
         return metrics
 
@@ -479,4 +598,4 @@ def main(
 if __name__ == "__main__":
     import strictfire
 
-    strictfire.StrictFire(main)
+    strictfire.StrictFire(main_analysis)

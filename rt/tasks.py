@@ -96,6 +96,8 @@ all_tasks = (
 
 forecast_tasks = forecast_clf_tasks + forecast_reg_tasks
 
+forecast_tasks_dict = {t[1]: t for t in forecast_tasks}
+
 all_dbs = [
     "rel-amazon",
     "rel-hm",
